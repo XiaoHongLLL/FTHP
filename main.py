@@ -42,16 +42,17 @@ def prepare_dataloader(opt):
         # 确保 time_since_last_event > 0
         time_flat += [elem['time_since_last_event'] for elem in i if elem['time_since_last_event'] > 0]
 
-    time_flat = torch.tensor(time_flat, device=opt.device)
+    # 修复：确保在 CPU 上计算统计数据，以防 device 不可用或数据在 CPU
+    time_flat_tensor = torch.tensor(time_flat)  # , device=opt.device)
 
     time_mean = 1.0
     time_std = 1.0
 
     if opt.normalize == 'normal':
-        time_mean = time_flat.mean().item()
+        time_mean = time_flat_tensor.mean().item()
         print(f'[Info] Time Gap Mean (for normalization): {time_mean}')
     elif opt.normalize == 'log':
-        log_time = torch.log(time_flat)
+        log_time = torch.log(time_flat_tensor.clamp(min=1e-8))  # 避免 log(0)
         time_mean = log_time.mean().item()
         time_std = log_time.std().item()
         print(f'[Info] Log Time Gap Mean: {time_mean}, Std: {time_std}')
@@ -78,6 +79,7 @@ def train_epoch(model, training_data, optimizer, pred_loss_func, opt):
     model.train()
     total_loss = 0
     total_num_event = 0
+    total_correct = 0  # <-- 新增：用于计算准确率
 
     for batch in tqdm(training_data, mininterval=2, desc='  - (Training)   ', leave=False):
         """ prepare data """
@@ -96,14 +98,37 @@ def train_epoch(model, training_data, optimizer, pred_loss_func, opt):
         loss.backward()
         optimizer.step()
 
+        # --- (新增) 计算辅助准确率 ---
+        with torch.no_grad():  # 不追踪梯度
+            type_logits = prediction['type_logits']  # (B, L-1, NumTypes)
+            pred_type = type_logits.argmax(dim=-1)  # (B, L-1)
+            target_type = event_type[:, 1:]  # (B, L-1), 1-based index
+
+            non_pad_mask = (target_type != Constants.PAD)
+            # 比较 0-based pred_type 和 0-based target (target_type - 1)
+            correct_preds = (pred_type == (target_type - 1)) & non_pad_mask
+
+            total_correct += correct_preds.sum().item()
+        # --- 结束新增 ---
+
         """ note keeping """
-        total_loss += loss.item()
         # 实际参与 loss 计算的事件数
         num_event = (event_type[:, 1:] != Constants.PAD).sum().item()
+
+        # 修复：用 平均loss * 事件数 = 该批次的总loss
+        if num_event > 0:
+            total_loss += loss.item() * num_event
+
         total_num_event += num_event
 
     # (acc 暂时不计算)
-    return total_loss / total_num_event, 0.0
+    # 修复：避免除以 0
+    if total_num_event == 0:
+        return 0.0, 0.0
+
+    final_loss = total_loss / total_num_event
+    final_acc = total_correct / total_num_event  # <-- 新增：返回计算出的准确率
+    return final_loss, final_acc
 
 
 def eval_epoch(model, validation_data, pred_loss_func, eval_generation, opt):
@@ -113,6 +138,7 @@ def eval_epoch(model, validation_data, pred_loss_func, eval_generation, opt):
 
     total_loss = 0
     total_num_event = 0
+    total_correct = 0  # <-- 新增：用于计算准确率
 
     # --- 阶段 1: 计算验证集 Loss (同 train_epoch) ---
     if not eval_generation:
@@ -120,17 +146,42 @@ def eval_epoch(model, validation_data, pred_loss_func, eval_generation, opt):
         with torch.no_grad():
             for batch in tqdm(validation_data, mininterval=2, desc='  - (Validating) ', leave=False):
                 event_time, time_gap, event_type = map(lambda x: x.to(opt.device), batch)
-                enc_out, prediction = model(event_time, time_gap, event_type)
+                # 修复：参数顺序
+                enc_out, prediction = model(event_type, event_time, time_gap)
                 loss = model.compute_loss(enc_out, event_time, time_gap, event_type, prediction, None)
 
-                total_loss += loss.item()
+                # --- (新增) 计算辅助准确率 ---
+                type_logits = prediction['type_logits']  # (B, L-1, NumTypes)
+                pred_type = type_logits.argmax(dim=-1)  # (B, L-1)
+                target_type = event_type[:, 1:]  # (B, L-1), 1-based index
+
+                non_pad_mask = (target_type != Constants.PAD)
+                # 比较 0-based pred_type 和 0-based target (target_type - 1)
+                correct_preds = (pred_type == (target_type - 1)) & non_pad_mask
+
+                total_correct += correct_preds.sum().item()
+                # --- 结束新增 ---
+
                 num_event = (event_type[:, 1:] != Constants.PAD).sum().item()
+
+                # 修复：用 平均loss * 事件数 = 该批次的总loss
+                if num_event > 0:
+                    total_loss += loss.item() * num_event
+
                 total_num_event += num_event
 
+        # 修复：避免除以 0
+        if total_num_event == 0:
+            final_loss = 0.0
+            final_acc = 0.0
+        else:
+            final_loss = total_loss / total_num_event
+            final_acc = total_correct / total_num_event  # <-- 新增：计算最终准确率
+
         print('  - (Validating) loss: {ll: 8.5f}, elapse: {elapse:3.3f} min'
-              .format(ll=total_loss / total_num_event, elapse=(time.time() - start) / 60))
-        # (acc 暂时不计算)
-        return total_loss / total_num_event, 0.0
+              .format(ll=final_loss, elapse=(time.time() - start) / 60))
+
+        return final_loss, final_acc  # <-- 新增：返回计算出的准确率
 
     # --- 阶段 2: 逆向生成样本 (SMURF 的 eval_langevin) ---
     if eval_generation:
@@ -155,6 +206,10 @@ def eval_epoch(model, validation_data, pred_loss_func, eval_generation, opt):
 
         solver = ODESolver(VelocityModelWrapper(model.v_field))
 
+        # 修复：确保 opt.eval_quantile 是数组
+        if isinstance(opt.eval_quantile, float):
+            raise ValueError("opt.eval_quantile is a float, expected array. Check main() logic.")
+
         total_coverage_single = torch.zeros(len(opt.eval_quantile))
         total_intlen = torch.zeros(len(opt.eval_quantile))
         total_crps = 0
@@ -170,7 +225,8 @@ def eval_epoch(model, validation_data, pred_loss_func, eval_generation, opt):
 
                 # 1. 获取历史编码 C
                 non_pad_mask = get_non_pad_mask(event_type)
-                enc_output = model.encoder(event_time, event_time, non_pad_mask)  # (B, L, D_model)
+                # 修复：参数顺序
+                enc_output = model.encoder(event_type, event_time, non_pad_mask)  # (B, L, D_model)
 
                 # 找到每个序列最后一个非 PAD 事件的索引 (用于评估)
                 seq_lengths = event_type.ne(Constants.PAD).sum(dim=1)  # (B,)
@@ -265,6 +321,11 @@ def eval_epoch(model, validation_data, pred_loss_func, eval_generation, opt):
                 total_num_pred += B  # 评估的序列数
 
         # --- 报告结果 ---
+        # 修复：避免除以 0
+        if total_num_pred == 0:
+            print("[Warning] No predictions made during evaluation.")
+            return {'cs': 0, 'accuracy': 0, 'crps': 0, 'intlen': 0}
+
         total_coverage_single /= total_num_pred
         total_intlen /= total_num_pred
         total_crps /= total_num_pred
@@ -313,7 +374,8 @@ def train(config=None):
         if config.scheduler == 'cosLR':
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, 64, verbose=True)
         elif config.scheduler == 'reduce':
-            scheduler = optim.lr_scheduler.ReduceL_on_Plateau(optimizer, mode='min', verbose=True)  # 应该按 loss 降低
+            # 修复：拼写错误
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', verbose=True)
 
         # pred_loss_func 在模型内部定义
         pred_loss_func = None
@@ -336,6 +398,7 @@ def train(config=None):
 
             start = time.time()
             valid_loss, valid_acc = eval_epoch(model, devloader, pred_loss_func, False, config)
+            # <-- 新增：在打印时使用计算出的 valid_acc
             print('  - (Validating)  loss: {ll: 8.5f}, accuracy: {type: 8.5f}, elapse: {elapse:3.3f} min'
                   .format(ll=valid_loss, type=valid_acc, elapse=(time.time() - start) / 60))
 
@@ -362,6 +425,54 @@ def train(config=None):
 
 
 # (eval 函数需要类似地修改以加载模型并调用 eval_epoch(..., eval_generation=True, ...))
+def eval(config):
+    """ Evaluation phase. """
+
+    # 修复：添加 pickle
+    import pickle
+
+    # --- 1. 准备数据 (同 train, 但不需要 trainloader) ---
+    _, devloader, testloader, num_types = prepare_dataloader(config)
+    config.num_types = num_types
+
+    # --- 2. 准备模型 ---
+    model = FlowMatchingTHP(num_types, config)
+    model.time_mean = config.time_mean
+    model.time_std = config.time_std
+    model.to(config.device)
+
+    # --- 3. 加载已保存的 checkpoint ---
+    if config.load_path_name:
+        print(f"[Info] Loading model from {config.load_path_name}")
+        try:
+            checkpoint = torch.load(config.load_path_name)
+            model.load_state_dict(checkpoint['model'])
+            print(
+                f"[Info] Model loaded successfully (epoch {checkpoint.get('epoch', 'N/A')}, loss {checkpoint.get('best_loss', 'N/A')}).")
+        except Exception as e:
+            print(f"[Error] Failed to load model: {e}")
+            return
+    else:
+        print("[Error] No model specified for evaluation. Use -load_path_name.")
+        return
+
+    # pred_loss_func 在模型内部定义
+    pred_loss_func = None
+
+    # --- 4. 运行评估 ---
+    print("[Info] Starting evaluation...")
+    start = time.time()
+    # 运行 eval_epoch，并强制开启 eval_generation=True
+    test_results = eval_epoch(model, testloader, pred_loss_func, True, config)
+
+    print("[Info] Evaluation finished.")
+    # (您可以选择将 test_results 保存到 config.save_result 指定的文件中)
+    # 比如：
+    # if config.save_result:
+    #    print(f"Saving results to {config.save_result}")
+    #    with open(config.save_result, 'wb') as f:
+    #        pickle.dump(test_results, f)
+
 
 def main():
     """ Main function. """
@@ -416,11 +527,6 @@ def main():
     # default device is CUDA
     opt.device = torch.device('cuda')
 
-    if opt.eval_quantile == -1:
-        opt.eval_quantile = np.arange(opt.eval_quantile_step, 1, opt.eval_quantile_step)
-    else:
-        NotImplementedError, "Please set eval_quantile to -1"
-
     # set seed
     torch.manual_seed(opt.seed)
     torch.cuda.manual_seed_all(opt.seed)
@@ -429,13 +535,26 @@ def main():
     # opt = wandb.config.update(opt) # (wandb optional)
     print('[Info] parameters: {}'.format(opt))
 
+    # 修复：将 eval_quantile 逻辑移到 train/eval 调用之前
+    if int(opt.eval_quantile) == -1:
+        # 修复：使用 torch.arange 代替 np.arange，并指定 device
+        opt.eval_quantile = torch.arange(
+            opt.eval_quantile_step, 1, opt.eval_quantile_step,
+            device=opt.device, dtype=torch.float32
+        )
+    else:
+        # 修复：使用 'raise' 来真正地停止程序
+        raise NotImplementedError("Please set eval_quantile to -1. Other values are not supported.")
+
+    # 修复：删除重复的逻辑，只保留一个调用块
     if not opt.just_eval:
         train(opt)
     else:
-        # eval(opt) # (eval 函数也需要相应修改)
-        print("[Info] Evaluation-only mode needs to be adapted similarly to train().")
-        pass
+        # 现在我们可以调用新添加的 eval 函数了
+        eval(opt)
+        print("[Info] Evaluation complete.")
 
 
 if __name__ == '__main__':
     main()
+
